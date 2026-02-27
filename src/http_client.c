@@ -9,16 +9,127 @@
 #include "http_client.h"
 
 #include <curl/curl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #define USER_AGENT "synclyr2metadata (https://github.com/newtonsart/synclyr2metadata)"
 
 /* ── Thread-local CURL handle ─────────────────────────────────────────── */
 
 static __thread CURL *tls_curl = NULL;
+
+static const char *first_readable_file(const char *const *paths, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (paths[i] && paths[i][0] != '\0' && access(paths[i], R_OK) == 0) {
+            return paths[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *first_readable_dir(const char *const *paths, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (paths[i] &&
+            paths[i][0] != '\0' &&
+            access(paths[i], R_OK | X_OK) == 0) {
+            return paths[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *detect_ca_file(void)
+{
+    const char *const env_files[] = {
+        getenv("CURL_CA_BUNDLE"),
+        getenv("SSL_CERT_FILE"),
+        getenv("REQUESTS_CA_BUNDLE")
+    };
+    const char *env_file = first_readable_file(env_files,
+                                               sizeof(env_files) /
+                                               sizeof(env_files[0]));
+    if (env_file) {
+        return env_file;
+    }
+
+    static const char *const system_files[] = {
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/tls/cacert.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+    };
+    return first_readable_file(system_files,
+                               sizeof(system_files) / sizeof(system_files[0]));
+}
+
+static const char *detect_ca_path(void)
+{
+    const char *const env_dirs[] = {
+        getenv("SSL_CERT_DIR")
+    };
+    const char *env_dir = first_readable_dir(env_dirs,
+                                             sizeof(env_dirs) /
+                                             sizeof(env_dirs[0]));
+    if (env_dir) {
+        return env_dir;
+    }
+
+    static const char *const system_dirs[] = {
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs",
+        "/etc/pki/ca-trust/extracted/pem"
+    };
+    return first_readable_dir(system_dirs,
+                              sizeof(system_dirs) / sizeof(system_dirs[0]));
+}
+
+static int is_ca_error(CURLcode code)
+{
+    (void)code;
+#ifdef CURLE_SSL_CACERT_BADFILE
+    if (code == CURLE_SSL_CACERT_BADFILE) {
+        return 1;
+    }
+#endif
+#ifdef CURLE_PEER_FAILED_VERIFICATION
+    if (code == CURLE_PEER_FAILED_VERIFICATION) {
+        return 1;
+    }
+#endif
+#ifdef CURLE_SSL_CACERT
+    if (code == CURLE_SSL_CACERT) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static void print_ca_hint(CURLcode code, const char *ca_file,
+                          const char *ca_path)
+{
+    if (!is_ca_error(code)) {
+        return;
+    }
+
+    fprintf(stderr,
+            "hint: TLS CA bundle was not found/readable in this runtime.\n");
+    if (ca_file) {
+        fprintf(stderr, "hint: using CA file candidate: %s\n", ca_file);
+    }
+    if (ca_path) {
+        fprintf(stderr, "hint: using CA directory candidate: %s\n", ca_path);
+    }
+    fprintf(stderr,
+            "hint: set CURL_CA_BUNDLE or SSL_CERT_FILE if your cert store is in a custom path.\n");
+}
 
 /*
  * Get or create the thread-local CURL handle.
@@ -118,6 +229,8 @@ HttpResponse *http_get(const char *url)
     if (!curl) {
         return NULL;
     }
+    const char *ca_file = detect_ca_file();
+    const char *ca_path = detect_ca_path();
 
     for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         HttpResponse *resp = calloc(1, sizeof(HttpResponse));
@@ -134,6 +247,12 @@ HttpResponse *http_get(const char *url)
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+        if (ca_file) {
+            curl_easy_setopt(curl, CURLOPT_CAINFO, ca_file);
+        }
+        if (ca_path) {
+            curl_easy_setopt(curl, CURLOPT_CAPATH, ca_path);
+        }
 
         CURLcode res = curl_easy_perform(curl);
 
@@ -155,6 +274,7 @@ HttpResponse *http_get(const char *url)
         } else {
             fprintf(stderr, "error: HTTP request failed: %s\n",
                     curl_easy_strerror(res));
+            print_ca_hint(res, ca_file, ca_path);
             return NULL;
         }
     }
