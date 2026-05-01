@@ -1,0 +1,98 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  # 1. LINUX JOB (Static Build)
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Static Linux
+        run: make
+      - name: Upload Linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: synclyr2metadata-linux
+          path: synclyr2metadata
+
+  # 2. MACOS & WINDOWS JOB (Dynamic/Native Build)
+  build-other:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            output: synclyr2metadata
+            artifact: synclyr2metadata-macos
+          - os: windows-latest
+            output: synclyr2metadata.exe
+            artifact: synclyr2metadata-windows
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Mac Deps
+        if: matrix.os == 'macos-latest'
+        run: brew install curl taglib
+
+      - name: Install Windows Deps
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-taglib
+
+      - name: Build Mac
+        if: matrix.os == 'macos-latest'
+        run: |
+          make native \
+            CFLAGS="-O2 -I/opt/homebrew/include -Iinclude -Ithird_party/cjson" \
+            LDFLAGS="-L/opt/homebrew/lib -lcurl -ltag_c -ltag -lz -lpthread"
+
+      - name: Build Windows
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: |
+          make native \
+            LDFLAGS="-lcurl -ltag_c -ltag -lz -lpthread -lws2_32 -lcrypt32"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.output }}
+
+  # 3. RELEASE JOB (Combines everything)
+  release:
+    needs: [build-linux, build-other]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Prepare Files for Release
+        run: |
+          mv synclyr2metadata-linux/synclyr2metadata ./synclyr2metadata-linux-amd64
+          mv synclyr2metadata-macos/synclyr2metadata ./synclyr2metadata-macos-arm64
+          mv synclyr2metadata-windows/synclyr2metadata.exe ./synclyr2metadata-windows-x64.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            synclyr2metadata-linux-amd64
+            synclyr2metadata-macos-arm64
+            synclyr2metadata-windows-x64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
