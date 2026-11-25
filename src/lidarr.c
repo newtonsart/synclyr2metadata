@@ -239,8 +239,8 @@ static void lidarr_sync_dir(const char *dirpath, const char *plain_log, const ch
     SyncResult r = sync_tracks(list, &config, lidarr_progress, NULL);
     metadata_list_free(list);
 
-    log_msg("Done: %d synced, %d plain, %d skipped, %d not found",
-            r.synced, r.plain, r.skipped, r.not_found);
+    log_msg("Done: %d synced, %d plain, %d skipped, %d not found, %d errors",
+            r.synced, r.plain, r.skipped, r.not_found, r.errors);
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */

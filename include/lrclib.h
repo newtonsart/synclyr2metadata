@@ -8,6 +8,10 @@
 #ifndef LRCLIB_H
 #define LRCLIB_H
 
+/* Per-track lookup state: distinguish temporary API failures from misses. */
+void lrclib_lookup_reset(void);
+int lrclib_lookup_failed(void);
+
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 

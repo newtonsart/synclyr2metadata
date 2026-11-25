@@ -197,10 +197,17 @@ static LrclibTrack *parse_track(const cJSON *obj)
  * Returns a cJSON object on success, NULL on failure.
  * Caller must free the result with cJSON_Delete().
  */
+static __thread int lookup_failed;
+
+void lrclib_lookup_reset(void) { lookup_failed = 0; }
+int lrclib_lookup_failed(void) { return lookup_failed; }
+
 static cJSON *api_request(const char *url)
 {
+    if (lookup_failed) return NULL;
     HttpResponse *resp = http_get(url);
     if (!resp) {
+        lookup_failed = 1;
         return NULL;
     }
 
@@ -208,8 +215,11 @@ static cJSON *api_request(const char *url)
         if (resp->status_code == 404) {
             /* Not found is a valid "no result", not an error */
         } else {
-            fprintf(stderr, "error: LRCLIB API returned HTTP %ld\n",
-                    resp->status_code);
+            lookup_failed = 1;
+            /* The HTTP client already logs the global 429 cooldown. */
+            if (resp->status_code != 429)
+                fprintf(stderr, "error: LRCLIB API returned HTTP %ld\n",
+                        resp->status_code);
         }
         http_response_free(resp);
         return NULL;
@@ -219,6 +229,7 @@ static cJSON *api_request(const char *url)
     http_response_free(resp);
 
     if (!json) {
+        lookup_failed = 1;
         fprintf(stderr, "error: failed to parse API response as JSON\n");
     }
 

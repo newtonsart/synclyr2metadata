@@ -91,10 +91,11 @@ static int try_api_lrc(const TrackMeta *t, const SyncConfig *cfg,
                        int *out_synced, int *out_plain, int *out_skipped,
                        int *out_not_found, int *out_error, const char **out_status)
 {
+    lrclib_lookup_reset();
     /* Refined LRCLIB lookup: exact match first */
     LrclibTrack *lrc = lrclib_get(t->artist, t->title, t->album, (double)t->duration);
 
-    if (cfg->prefer_synced &&
+    if (!lrclib_lookup_failed() && cfg->prefer_synced &&
         (!lrc || (!lrc->instrumental &&
                   (!lrc->synced_lyrics || lrc->synced_lyrics[0] == '\0')))) {
         LrclibTrack *candidate = lrclib_search_best(t->artist, t->title, t->album,
@@ -112,9 +113,17 @@ static int try_api_lrc(const TrackMeta *t, const SyncConfig *cfg,
     }
 
     /* Fallback: relax constraints if lyrics or track not found */
-    if (!lrc || (!lrc->synced_lyrics && !lrc->instrumental)) {
+    if (!lrclib_lookup_failed() &&
+        (!lrc || (!lrc->synced_lyrics && !lrc->plain_lyrics && !lrc->instrumental))) {
         lrclib_track_free(lrc);
         lrc = lrclib_get(t->artist, t->title, NULL, 0);
+    }
+
+    if (lrclib_lookup_failed()) {
+        lrclib_track_free(lrc);
+        *out_error = 1;
+        *out_status = "API unavailable (retry later)";
+        return 1;
     }
 
     if (!lrc) {
@@ -176,6 +185,12 @@ static void process_track(const TrackMeta *t, const SyncConfig *cfg,
                           int *out_error, const char **out_status)
 {
     *out_synced = *out_plain = *out_skipped = *out_not_found = *out_error = 0;
+
+    if (!cfg->force && t->has_lyrics) {
+        *out_skipped = 1;
+        *out_status = "already has lyrics";
+        return;
+    }
 
     if (!t->artist || !t->title) {
         *out_not_found = 1;

@@ -15,12 +15,85 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
 
-#define USER_AGENT "synclyr2metadata (https://github.com/newtonsart/synclyr2metadata)"
+#define USER_AGENT "synclyr2metadata/9b9a9ef-local (https://github.com/newtonsart/synclyr2metadata)"
+#define AUTH_FILE "/etc/synclyr2metadata/credentials"
+#define API_ORIGIN "https://lrclib.net/api/"
 
 /* ── Thread-local CURL handle ─────────────────────────────────────────── */
 
 static __thread CURL *tls_curl = NULL;
+
+/* One shared request budget for all workers; use monotonic time. */
+static pthread_mutex_t request_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct timespec next_request;
+static int rate_limited;
+static struct curl_slist *auth_headers;
+static int has_api_key;
+
+static int append_header(const char *name, const char *value)
+{
+    if (!value || !*value) return 0;
+    if (strpbrk(value, "\r\n")) return -1;
+    char line[512];
+    int n = snprintf(line, sizeof(line), "%s: %s", name, value);
+    if (n < 0 || (size_t)n >= sizeof(line)) return -1;
+    struct curl_slist *next = curl_slist_append(auth_headers, line);
+    if (!next) return -1;
+    auth_headers = next;
+    return 0;
+}
+
+static int load_auth(void)
+{
+    char app[256] = "", key[256] = "", line[512];
+    FILE *f = fopen(AUTH_FILE, "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (!strncmp(line, "LRCLIB_APP_ID=", 14)) {
+                if (strlen(line + 14) >= sizeof(app)) { fclose(f); return -1; }
+                strcpy(app, line + 14);
+            } else if (!strncmp(line, "LRCLIB_API_KEY=", 15)) {
+                if (strlen(line + 15) >= sizeof(key)) { fclose(f); return -1; }
+                strcpy(key, line + 15);
+            }
+        }
+        fclose(f);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "error: cannot read LRCLIB credentials file\n");
+        return -1;
+    }
+    const char *a = getenv("LRCLIB_APP_ID");
+    const char *k = getenv("LRCLIB_API_KEY");
+    if (!a) a = app;
+    if (!k) k = key;
+    if (append_header("Lrclib-App-Id", a) || append_header("Lrclib-Api-Key", k)) {
+        curl_slist_free_all(auth_headers);
+        auth_headers = NULL;
+        return -1;
+    }
+    has_api_key = *k != 0;
+    if (has_api_key) fprintf(stderr, "LRCLIB: authenticated mode (250ms delay)\n");
+    return 0;
+}
+
+static void wait_until(struct timespec deadline)
+{
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL) == EINTR) {}
+}
+
+static void delay_requests(long seconds, long nanoseconds)
+{
+    clock_gettime(CLOCK_MONOTONIC, &next_request);
+    next_request.tv_sec += seconds;
+    next_request.tv_nsec += nanoseconds;
+    if (next_request.tv_nsec >= 1000000000L) {
+        next_request.tv_sec++;
+        next_request.tv_nsec -= 1000000000L;
+    }
+}
 
 static const char *first_readable_file(const char *const *paths, size_t count)
 {
@@ -181,7 +254,12 @@ static size_t write_callback(char *data, size_t size, size_t nmemb,
 int http_init(void)
 {
     CURLcode res = curl_global_init(CURL_GLOBAL_DEFAULT);
-    return (res == CURLE_OK) ? 0 : -1;
+    if (res != CURLE_OK) return -1;
+    if (load_auth() != 0) {
+        curl_global_cleanup();
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -244,7 +322,10 @@ HttpResponse *http_get(const char *url)
         curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        /* Restrict authentication to the intended HTTPS API; never redirect secrets. */
+        int authenticated = auth_headers && !strncmp(url, API_ORIGIN, sizeof(API_ORIGIN)-1);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, authenticated ? 0L : 1L);
+        if (authenticated) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, auth_headers);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
         if (ca_file) {
@@ -254,13 +335,49 @@ HttpResponse *http_get(const char *url)
             curl_easy_setopt(curl, CURLOPT_CAPATH, ca_path);
         }
 
+        pthread_mutex_lock(&request_lock);
+        if (rate_limited) {
+            pthread_mutex_unlock(&request_lock);
+            resp->status_code = 429;
+            return resp;
+        }
+
+        wait_until(next_request);
         CURLcode res = curl_easy_perform(curl);
+        if (authenticated && has_api_key) delay_requests(0, 250000000L);
+        else delay_requests(1, 0);
 
         if (res == CURLE_OK) {
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE,
                               &resp->status_code);
+            if (resp->status_code == 429) {
+                curl_off_t retry_after = 0;
+                curl_easy_getinfo(curl, CURLINFO_RETRY_AFTER, &retry_after);
+                long delay = 5L << attempt;
+                if (retry_after > 60 || attempt == MAX_RETRIES) {
+                    rate_limited = 1;
+                    fprintf(stderr, "warning: LRCLIB rate limited; deferring remaining requests in this run\n");
+                    pthread_mutex_unlock(&request_lock);
+                    return resp;
+                }
+                if (retry_after > delay) delay = (long)retry_after;
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long jitter = now.tv_nsec % 500000000L;
+                delay_requests(delay, jitter);
+                fprintf(stderr, "warning: HTTP 429; global cooldown %lds (%d/%d)\n",
+                        delay, attempt + 1, MAX_RETRIES);
+                /* Hold the request lock during the retry loop's wait so
+                 * other workers cannot make requests during cooldown. */
+                wait_until(next_request);
+                pthread_mutex_unlock(&request_lock);
+                http_response_free(resp);
+                continue;
+            }
+            pthread_mutex_unlock(&request_lock);
             return resp;
         }
+        pthread_mutex_unlock(&request_lock);
 
         /* Request failed */
         http_response_free(resp);
@@ -294,5 +411,8 @@ void http_response_free(HttpResponse *resp)
 void http_cleanup(void)
 {
     http_thread_cleanup();
+    curl_slist_free_all(auth_headers);
+    auth_headers = NULL;
+    has_api_key = 0;
     curl_global_cleanup();
 }

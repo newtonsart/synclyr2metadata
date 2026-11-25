@@ -15,6 +15,7 @@ typedef struct {
     char *artist;
     char *album;
     int   track_number;
+    int   has_lyrics;     /* Existing nonempty embedded lyrics */
     int   duration;       /* Duration in seconds */
     char *filepath;
 } TrackMeta;

@@ -102,6 +102,10 @@ TrackMeta *metadata_read(const char *filepath)
         meta->duration = taglib_audioproperties_length(props);
     }
 
+    char **lyrics = taglib_property_get(file, "LYRICS");
+    meta->has_lyrics = (lyrics && lyrics[0] && lyrics[0][0] != '\0');
+    taglib_property_free(lyrics);
+
     meta->filepath = strdup(filepath);
 
     /* Clean up TagLib allocated strings */
