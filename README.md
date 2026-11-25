@@ -15,6 +15,47 @@ Supports **FLAC**, **MP3**, **OGG**, **M4A/AAC**, **OPUS**, and more (powered by
 
 ---
 
+## LRCLIB authentication (optional)
+
+Anonymous requests work without configuration. For large libraries, register a server-side application in the [LRCLIB developer portal](https://lrclib.net/developers) and obtain an App ID and API key.
+
+### Native installation / Lidarr service
+
+Create the credentials file outside the repository:
+
+```bash
+sudo install -d -m 700 /etc/synclyr2metadata
+sudo touch /etc/synclyr2metadata/credentials
+sudo chmod 600 /etc/synclyr2metadata/credentials
+sudoedit /etc/synclyr2metadata/credentials
+```
+
+Add the following lines, replacing the placeholders with your own credentials:
+
+```dotenv
+LRCLIB_APP_ID=YOUR_APP_ID
+LRCLIB_API_KEY=YOUR_API_KEY
+```
+
+The credentials file and its directory must be accessible to the user running synclyr2metadata (including the Lidarr service user). Keep the file private and adjust ownership if Lidarr runs as a dedicated user.
+
+### Environment variables / Docker
+
+The same variables can be supplied through the process environment instead. Environment variables override the corresponding values in the credentials file. For Docker, pass them securely to the Lidarr container, or mount the credentials file read-only at `/etc/synclyr2metadata/credentials`.
+
+Never commit real credentials or expose them in logs. The program sends them only to the LRCLIB API over HTTPS.
+
+### Rate limiting
+
+- With an API key: sequential HTTP requests with a 250 ms delay after each response.
+- Without an API key: a 1 second delay after each response.
+- HTTP 429: global cooldown across worker threads, respecting `Retry-After` and using bounded exponential backoff with jitter. If the limit persists, remaining requests are deferred until another run.
+- Existing embedded lyrics are skipped before making API requests unless `--force` is supplied. Temporary API failures are reported as errors, not missing lyrics.
+
+Authenticated mode prints `LRCLIB: authenticated mode (250ms delay)` at startup.
+
+---
+
 ## 🎵 Lidarr Integration
 
 Auto-sync lyrics every time Lidarr imports a new album.  
