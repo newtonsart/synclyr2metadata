@@ -58,6 +58,21 @@ Authenticated mode prints `LRCLIB: authenticated mode (250ms delay)` at startup.
 
 ## 🎵 Lidarr Integration
 
+The native integration handles AlbumDownload (release imports and upgrades) using the supplied track paths, and TrackRetag using the single retagged file. It skips existing lyrics and serializes Lidarr event executions with an adjacent lock file. Ensure the service user can write that lock file and the logs. TrackRetag requires Lidarr to write audio tags; it does not guarantee a notification for every manual import.
+
+For a non-root service account, grant a dedicated group read access to the credentials without making them world-readable. For example, on a native Linux installation, replace `SERVICE_USER` with the account running the script:
+
+```bash
+sudo groupadd --system lrclib
+sudo usermod -aG lrclib SERVICE_USER
+sudo chgrp lrclib /etc/synclyr2metadata /etc/synclyr2metadata/credentials
+sudo chmod 750 /etc/synclyr2metadata
+sudo chmod 640 /etc/synclyr2metadata/credentials
+```
+
+If the group already exists, skip its creation. Restart the affected service so it receives the supplementary group. The account also needs write access to audio metadata and the script's lock and log files. Never grant world-readable permissions to the credentials.
+
+
 Auto-sync lyrics every time Lidarr imports a new album.  
 **Only one file to deploy** — the binary is fully static with zero runtime dependencies.
 
@@ -95,6 +110,7 @@ cp synclyr2metadata /path/to/lidarr/config/scripts/
    - **Name**: `Sync Lyrics`
    - **On Release Import**: ✓
    - **On Upgrade**: ✓
+   - **On Track Retag**: ✓
    - **Path**: `/config/scripts/synclyr2metadata`
 3. Click **Test**, then **Save**.
 
@@ -140,6 +156,7 @@ cp synclyr2metadata /path/to/lidarr/scripts/
    - **Name**: `Sync Lyrics`
    - **On Release Import**: ✓
    - **On Upgrade**: ✓
+   - **On Track Retag**: ✓
    - **Path**: `/path/to/synclyr2metadata`
 3. Click **Test**, then **Save**.
 

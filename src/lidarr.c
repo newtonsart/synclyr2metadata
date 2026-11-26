@@ -8,6 +8,7 @@
  * Lidarr environment variables used:
  *   lidarr_eventtype        — "Test", "AlbumDownload", "Grab", etc.
  *   lidarr_addedtrackpaths  — pipe-separated list of imported file paths
+ *   lidarr_trackfile_path   — single retagged file (TrackRetag)
  *   lidarr_artist_path      — root directory of the artist
  *   lidarr_album_title      — title of the imported album
  */
@@ -18,6 +19,10 @@
 #include "sync.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,34 +144,11 @@ static void log_msg(const char *fmt, ...)
 
 /* ── Album directory detection ────────────────────────────────────────── */
 
-/*
- * Extract the album directory from lidarr_addedtrackpaths.
- * The variable contains pipe-separated full file paths.
- * We take the first path and strip the filename to get the directory.
- *
- * Returns a heap-allocated string, or NULL if not available.
- */
-static char *album_dir_from_tracks(void)
+/* Lidarr normally exports lower-case names; accept original casing too. */
+static const char *event_env(const char *lower, const char *original)
 {
-    const char *paths = getenv("lidarr_addedtrackpaths");
-    if (!paths || !paths[0]) return NULL;
-
-    /* Isolate the first path (before the first '|') */
-    const char *sep = strchr(paths, '|');
-    size_t len = sep ? (size_t)(sep - paths) : strlen(paths);
-
-    char *first = malloc(len + 1);
-    if (!first) return NULL;
-    memcpy(first, paths, len);
-    first[len] = '\0';
-
-    /* Strip the filename → keep only the directory */
-    char *slash = strrchr(first, '/');
-    if (slash && slash != first) {
-        *slash = '\0';
-    }
-
-    return first;
+    const char *v = getenv(lower);
+    return v && *v ? v : getenv(original);
 }
 
 /*
@@ -216,16 +198,15 @@ static void lidarr_progress(int idx, int total, const char *title,
 /*
  * Scan and sync a single directory, logging results.
  */
-static void lidarr_sync_dir(const char *dirpath, const char *plain_log, const char *missing_log)
+static int lidarr_sync_list(TrackMetaList *list, const char *label, const char *plain_log, const char *missing_log)
 {
-    TrackMetaList *list = metadata_scan_dir(dirpath);
     if (!list || list->count == 0) {
         if (list) metadata_list_free(list);
-        log_msg("No audio files found in '%s'", dirpath);
-        return;
+        log_msg("No audio files found in '%s'", label);
+        return 1;
     }
 
-    log_msg("Syncing %d track(s) in '%s'", list->count, dirpath);
+    log_msg("Syncing %d track(s) in '%s'", list->count, label);
 
     SyncConfig config = {
         .force         = 0,
@@ -241,94 +222,101 @@ static void lidarr_sync_dir(const char *dirpath, const char *plain_log, const ch
 
     log_msg("Done: %d synced, %d plain, %d skipped, %d not found, %d errors",
             r.synced, r.plain, r.skipped, r.not_found, r.errors);
+    return r.errors ? 1 : 0;
+}
+
+/* Process only the paths supplied by the event, not adjacent files. */
+static TrackMetaList *list_from_paths(const char *paths, int single)
+{
+    TrackMetaList *list = calloc(1, sizeof(*list));
+    char *copy = strdup(paths);
+    if (!list || !copy) { free(list); free(copy); return NULL; }
+    char *save = NULL;
+    char *path = single ? copy : strtok_r(copy, "|", &save);
+    while (path) {
+        struct stat st;
+        TrackMeta *meta = NULL;
+        if (*path && stat(path, &st) == 0 && S_ISREG(st.st_mode))
+            meta = metadata_read(path);
+        if (!meta) {
+            log_msg("ERROR: cannot read event track: %s", path);
+            metadata_list_free(list);
+            free(copy);
+            return NULL;
+        }
+        TrackMeta **items = realloc(list->items, (list->count + 1) * sizeof(*items));
+        if (!items) {
+            metadata_free(meta);
+            metadata_list_free(list);
+            free(copy);
+            return NULL;
+        }
+        list->items = items;
+        list->items[list->count++] = meta;
+        path = single ? NULL : strtok_r(NULL, "|", &save);
+    }
+    free(copy);
+    return list;
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */
 
 int lidarr_detect(void)
 {
-    return getenv("lidarr_eventtype") != NULL;
+    return event_env("lidarr_eventtype", "Lidarr_EventType") != NULL;
 }
 
 int lidarr_run(const char *self_path)
 {
-    /* Set up logging next to the binary */
-    char *logpath = log_path_suffix(self_path, ".log");
-    if (logpath) {
-        log_open(logpath);
-        free(logpath);
-    }
-
-    char *plain_log = log_path_suffix(self_path, "_plain.log");
-    char *missing_log = log_path_suffix(self_path, "_missing.log");
-
-    /* Read event type */
-    const char *event = getenv("lidarr_eventtype");
-    if (!event) {
-        log_msg("ERROR: lidarr_eventtype not set");
-        return 1;
-    }
-
-    /* Handle events */
-    if (strcmp(event, "Test") == 0) {
-        log_msg("Test OK");
-        return 0;
-    }
-
-    if (strcmp(event, "AlbumDownload") != 0) {
+    const char *event = event_env("lidarr_eventtype", "Lidarr_EventType");
+    if (!event) return 1;
+    if (strcmp(event, "Test") == 0) { log_msg("Test OK"); return 0; }
+    int retag = strcmp(event, "TrackRetag") == 0;
+    if (!retag && strcmp(event, "AlbumDownload") != 0) {
         log_msg("Ignoring event: %s", event);
         return 0;
     }
 
-    /* AlbumDownload event — find the album directory */
-    const char *artist_path = getenv("lidarr_artist_path");
+    /* Serialize event processes so the HTTP request budget is not multiplied. */
+    char *lockpath = log_path_suffix(self_path, ".lock");
+    int lockfd = lockpath ? open(lockpath, O_CREAT | O_RDWR, 0660) : -1;
+    free(lockpath);
+    if (lockfd < 0) { perror("Lidarr event lock"); return 1; }
+    int locked;
+    do { locked = flock(lockfd, LOCK_EX); } while (locked < 0 && errno == EINTR);
+    if (locked < 0) { perror("Lidarr event lock"); close(lockfd); return 1; }
 
-    /* Strategy 1: derive from imported track paths */
-    char *album_dir = album_dir_from_tracks();
+    char *logpath = log_path_suffix(self_path, ".log");
+    if (logpath) { log_open(logpath); free(logpath); }
+    char *plain_log = log_path_suffix(self_path, "_plain.log");
+    char *missing_log = log_path_suffix(self_path, "_missing.log");
+    const char *paths = retag
+        ? event_env("lidarr_trackfile_path", "Lidarr_TrackFile_Path")
+        : event_env("lidarr_addedtrackpaths", "Lidarr_AddedTrackPaths");
+    char *album_dir = NULL;
+    int rc = 1;
+    log_msg("Event: %s", event);
 
-    /* Strategy 2: match album title under artist directory */
-    if ((!album_dir || album_dir[0] == '\0') && artist_path) {
-        free(album_dir);
-        album_dir = album_dir_from_title(artist_path,
-                                          getenv("lidarr_album_title"));
+    if (http_init() != 0) {
+        log_msg("ERROR: HTTP initialization failed");
+        goto done;
     }
-
-    /* Sync the album or fall back to the entire artist */
-    http_init();
-
-    if (album_dir && album_dir[0] != '\0') {
-        log_msg("Album: %s", album_dir);
-        lidarr_sync_dir(album_dir, plain_log, missing_log);
-    } else if (artist_path) {
-        log_msg("Album dir not found, syncing artist: %s", artist_path);
-        /* Iterate artist subdirs */
-        DIR *dir = opendir(artist_path);
-        if (dir) {
-            struct dirent *entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (entry->d_name[0] == '.') continue;
-                size_t len = strlen(artist_path) + strlen(entry->d_name) + 2;
-                char *sub = malloc(len);
-                if (!sub) continue;
-                snprintf(sub, len, "%s/%s", artist_path, entry->d_name);
-
-                struct stat st;
-                if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    lidarr_sync_dir(sub, plain_log, missing_log);
-                }
-                free(sub);
-            }
-            closedir(dir);
-        }
+    if (paths && *paths) {
+        rc = lidarr_sync_list(list_from_paths(paths, retag), event, plain_log, missing_log);
+    } else if (!retag) {
+        album_dir = album_dir_from_title(event_env("lidarr_artist_path", "Lidarr_Artist_Path"),
+                                         event_env("lidarr_album_title", "Lidarr_Album_Title"));
+        if (album_dir) rc = lidarr_sync_list(metadata_scan_dir(album_dir), album_dir, plain_log, missing_log);
+        else log_msg("ERROR: missing imported paths and album directory");
     } else {
-        log_msg("ERROR: could not determine album directory");
+        log_msg("ERROR: missing lidarr_trackfile_path");
     }
-
+    http_cleanup();
+done:
     free(album_dir);
     free(plain_log);
     free(missing_log);
-    http_cleanup();
-
-    if (log_fp) fclose(log_fp);
-    return 0;
+    if (log_fp) { fclose(log_fp); log_fp = NULL; }
+    close(lockfd);
+    return rc;
 }
